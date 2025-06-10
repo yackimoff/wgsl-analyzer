@@ -18,6 +18,7 @@
   - ✅ Keywords
   - ✅ Builtin Functions
   - ✅ Property Access
+ - ✅ Experimental support for Rust-style `#include` lines when referenced files are open
 
 ## Planned Features
 

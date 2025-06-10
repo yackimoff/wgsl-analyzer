@@ -19,6 +19,44 @@ use crate::{
     wgsl_error::{parse_error_to_lsp_diagnostic, validation_error_to_lsp_diagnostic},
 };
 
+fn preprocess_includes(
+    content: &str,
+    _uri: &Uri,
+    documents: &HashMap<Uri, TrackedDocument>,
+) -> String {
+    fn find_module<'a>(module: &str, documents: &'a HashMap<Uri, TrackedDocument>) -> Option<&'a TrackedDocument> {
+        for doc in documents.values() {
+            let path = doc.uri.path().as_str();
+            let without_ext = path.trim_start_matches('/').trim_end_matches(".wgsl");
+            let doc_module = without_ext.replace('/', "::");
+            if doc_module.ends_with(module) {
+                return Some(doc);
+            }
+        }
+        None
+    }
+
+    let mut result = String::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let directive = trimmed.strip_prefix("#include").or_else(|| trimmed.strip_prefix("#import"));
+        if let Some(rest) = directive {
+            let module = rest.trim().trim_end_matches(';').trim();
+            if let Some(doc) = find_module(module, documents) {
+                result.push_str(&doc.content);
+                result.push('\n');
+                continue;
+            }
+        }
+
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    result
+}
+
 pub struct TrackedDocument {
     pub uri: Uri,
     pub content: String,
@@ -32,19 +70,6 @@ type CompilationResult =
     Result<(Module, Result<ModuleInfo, naga::WithSpan<ValidationError>>), ParseError>;
 
 impl TrackedDocument {
-    pub fn compile_module(&mut self, validator: &mut Validator) -> &CompilationResult {
-        validator.reset();
-        let result = match naga::front::wgsl::parse_str(&self.content) {
-            Err(parse_error) => Err(parse_error),
-            Ok(module) => {
-                self.last_valid_module = Some(module.clone());
-                let validation_result = validator.validate(&module);
-                Ok((module, validation_result))
-            }
-        };
-
-        self.compilation_result.insert(result)
-    }
 
     pub fn get_lsp_diagnostics(&self) -> Vec<lsp_types::Diagnostic> {
         let Some(compilation_result) = &self.compilation_result else {
@@ -87,7 +112,7 @@ impl DocumentTracker {
     }
 
     pub fn insert(&mut self, doc: TextDocumentItem) {
-        let mut document = TrackedDocument {
+        let document = TrackedDocument {
             uri: doc.uri.to_owned(),
             content: doc.text.clone(),
             version: doc.version,
@@ -95,9 +120,9 @@ impl DocumentTracker {
             last_valid_module: None,
         };
 
-        document.compile_module(&mut self.validator);
-
+        let uri = doc.uri.clone();
         self.documents.insert(doc.uri, document);
+        self.compile_document(&uri);
     }
 
     pub fn update(&mut self, change: DidChangeTextDocumentParams) {
@@ -110,8 +135,9 @@ impl DocumentTracker {
                     doc.content = change.text;
                 }
             }
-            doc.compile_module(&mut self.validator);
         }
+
+        self.compile_document(&change.text_document.uri);
     }
 
     pub fn remove(&mut self, uri: &Uri) {
@@ -159,5 +185,28 @@ impl DocumentTracker {
             Range::new(Position::new(0, 0), Position::new(u32::MAX, u32::MAX)),
             result,
         )])
+    }
+
+    fn compile_document(&mut self, uri: &Uri) {
+        let (content, doc_uri) = if let Some(doc) = self.documents.get(uri) {
+            (doc.content.clone(), doc.uri.clone())
+        } else {
+            return;
+        };
+
+        let expanded = preprocess_includes(&content, &doc_uri, &self.documents);
+
+        let doc = self.documents.get_mut(uri).unwrap();
+        self.validator.reset();
+        let result = match naga::front::wgsl::parse_str(&expanded) {
+            Err(parse_error) => Err(parse_error),
+            Ok(module) => {
+                doc.last_valid_module = Some(module.clone());
+                let validation_result = self.validator.validate(&module);
+                Ok((module, validation_result))
+            }
+        };
+
+        doc.compilation_result = Some(result);
     }
 }
